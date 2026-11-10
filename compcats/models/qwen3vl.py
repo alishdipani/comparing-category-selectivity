@@ -10,6 +10,10 @@ Hookable layer names: ``taps.block_{i}`` (output of vision block i, 0-based,
 Submodule taps: ``taps.blocks.{i}.{norm1,attn,norm2,mlp}`` = output of that submodule in
 vision block i, (B, (S/16)^2, hidden), raster order. ``taps.blocks.8.norm1`` is the
 LayerNorm input to attention in block 8 (timm/open_clip ``trunk.blocks.8.norm1``).
+Pooled (channel-level) taps: ``taps.mean.<tap>`` for every tap above that is a token tap, e.g.
+``taps.mean.block_7``, ``taps.mean.blocks.8.norm1`` (not the merger): the mean over the image's
+tokens of the corresponding unpooled tap, (B, hidden) fp32 (mean computed in fp32 from the
+bf16 activations). Units are then channels. Cache dirs are .../taps.mean.block_7/ etc.
 Hooks are only computed for taps that have a listener attached.
 The encoder runs in `dtype` (float32 or bfloat16); tap outputs are cast to float32.
 Depth / hidden size come from the checkpoint's vision config.
@@ -85,6 +89,16 @@ class _Tower(nn.Module):
             for sub in BLOCK_SUBMODULES:
                 bt.add_module(sub, nn.Identity())
             self.taps.blocks.add_module(str(i), bt)
+        # pooled taps: taps.mean.block_{i}, taps.mean.blocks.{i}.{sub}  -> (B, hidden)
+        self.taps.add_module("mean", nn.Module())
+        for i in range(cfg.depth):
+            self.taps.mean.add_module(f"block_{i}", nn.Identity())
+        self.taps.mean.add_module("blocks", nn.Module())
+        for i in range(cfg.depth):
+            bt = nn.Module()
+            for sub in BLOCK_SUBMODULES:
+                bt.add_module(sub, nn.Identity())
+            self.taps.mean.blocks.add_module(str(i), bt)
         self._B = None
         for i, blk in enumerate(visual.blocks):
             blk.register_forward_hook(self._make_hook(f"block_{i}", True))
@@ -94,18 +108,28 @@ class _Tower(nn.Module):
         visual.merger.register_forward_hook(self._make_hook("merger", False))
 
     def _make_hook(self, name, reorder):
-        def hook(module, inp, out):
+        def get(prefix):
             tap = self.taps
-            for part in name.split("."):
+            for part in (prefix + name).split("."):
                 tap = getattr(tap, part)
-            if len(tap._forward_hooks) == 0:  # nobody listening
+            return tap
+        def hook(module, inp, out):
+            tap = get("")
+            ptap = get("mean.") if reorder else None
+            want_tok = len(tap._forward_hooks) > 0
+            want_mean = ptap is not None and len(ptap._forward_hooks) > 0
+            if not (want_tok or want_mean):  # nobody listening
                 return
             if isinstance(out, tuple):
                 out = out[0]
             x = out.reshape(self._B, -1, out.shape[-1])
             if reorder:
                 x = x[:, self.perm]
-            tap(x.float())
+            x = x.float()
+            if want_tok:
+                tap(x)
+            if want_mean:
+                ptap(x.mean(1))  # fp32 mean over tokens -> (B, hidden)
         return hook
 
     def forward(self, x):
