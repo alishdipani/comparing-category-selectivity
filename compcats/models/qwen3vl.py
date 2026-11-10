@@ -7,7 +7,8 @@ token order (row-major over the h x w patch grid); no pooling over tokens.
 Hookable layer names: ``taps.block_{i}`` (output of vision block i, 0-based,
 (B, (S/16)^2, hidden)) and ``taps.merger`` (patch-merger output,
 (B, (S/32)^2, out_hidden), merge-group = raster order of the coarse grid).
-All outputs are float32.
+The encoder runs in `dtype` (float32 or bfloat16); tap outputs are cast to float32.
+Depth / hidden size come from the checkpoint's vision config.
 
 Usage:
     model = get_model("Qwen/Qwen3-VL-2B-Instruct", image_size=224, dtype="bfloat16")
@@ -22,6 +23,7 @@ from .basemodel import BaseModel
 
 DEFAULT_REVISIONS = {
     "Qwen/Qwen3-VL-2B-Instruct": "89644892e4d85e24eaac8bacfd4f463576704203",
+    "Qwen/Qwen3-VL-8B-Instruct": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
 }
 
 def get_model(model_id="Qwen/Qwen3-VL-2B-Instruct", revision=None, image_size=224,
@@ -117,18 +119,35 @@ class Qwen3VLVision(BaseModel):
                                        if n not in self.relevant_layer_names]
 
     def _load_model(self):
+        import json
         from safetensors import safe_open
+        from huggingface_hub.errors import EntryNotFoundError
         from huggingface_hub import hf_hub_download
         from transformers import AutoConfig, AutoImageProcessor
         from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
         cfg = AutoConfig.from_pretrained(self.model_id, revision=self.revision).vision_config
         cfg._attn_implementation = "sdpa"
-        # Load only the vision tower weights ("model.visual.*") from the checkpoint
-        # (single-file checkpoints only; sharded ones would need the index file).
-        path = hf_hub_download(self.model_id, "model.safetensors", revision=self.revision)
-        with safe_open(path, "pt") as f:
-            sd = {k[len("model.visual."):]: f.get_tensor(k)
-                  for k in f.keys() if k.startswith("model.visual.")}
+        # Load only the vision tower weights ("model.visual.*"); handles single-file and
+        # sharded checkpoints (model.safetensors.index.json).
+        prefix = "model.visual."
+        sd = {}
+        try:
+            idx_path = hf_hub_download(self.model_id, "model.safetensors.index.json",
+                                       revision=self.revision)
+        except EntryNotFoundError:
+            idx_path = None
+        if idx_path is None:
+            files = ["model.safetensors"]
+        else:
+            with open(idx_path) as fh:
+                wm = json.load(fh)["weight_map"]
+            files = sorted({f for k, f in wm.items() if k.startswith(prefix)})
+        for fn in files:
+            path = hf_hub_download(self.model_id, fn, revision=self.revision)
+            with safe_open(path, "pt") as f:
+                for k in f.keys():
+                    if k.startswith(prefix):
+                        sd[k[len(prefix):]] = f.get_tensor(k)
         visual = Qwen3VLVisionModel(cfg)
         visual.load_state_dict(sd, strict=True)
         visual = visual.to(self.dtype).eval()
