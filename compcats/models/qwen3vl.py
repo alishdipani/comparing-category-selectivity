@@ -7,6 +7,10 @@ token order (row-major over the h x w patch grid); no pooling over tokens.
 Hookable layer names: ``taps.block_{i}`` (output of vision block i, 0-based,
 (B, (S/16)^2, hidden)) and ``taps.merger`` (patch-merger output,
 (B, (S/32)^2, out_hidden), merge-group = raster order of the coarse grid).
+Submodule taps: ``taps.blocks.{i}.{norm1,attn,norm2,mlp}`` = output of that submodule in
+vision block i, (B, (S/16)^2, hidden), raster order. ``taps.blocks.8.norm1`` is the
+LayerNorm input to attention in block 8 (timm/open_clip ``trunk.blocks.8.norm1``).
+Hooks are only computed for taps that have a listener attached.
 The encoder runs in `dtype` (float32 or bfloat16); tap outputs are cast to float32.
 Depth / hidden size come from the checkpoint's vision config.
 
@@ -25,6 +29,8 @@ DEFAULT_REVISIONS = {
     "Qwen/Qwen3-VL-2B-Instruct": "89644892e4d85e24eaac8bacfd4f463576704203",
     "Qwen/Qwen3-VL-8B-Instruct": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
 }
+
+BLOCK_SUBMODULES = ("norm1", "attn", "norm2", "mlp")
 
 def get_model(model_id="Qwen/Qwen3-VL-2B-Instruct", revision=None, image_size=224,
               dtype="float32", **kwargs):
@@ -72,14 +78,26 @@ class _Tower(nn.Module):
         for i in range(cfg.depth):
             self.taps.add_module(f"block_{i}", nn.Identity())
         self.taps.add_module("merger", nn.Identity())
+        # submodule taps: taps.blocks.{i}.{norm1,attn,norm2,mlp} (output of that submodule)
+        self.taps.add_module("blocks", nn.Module())
+        for i in range(cfg.depth):
+            bt = nn.Module()
+            for sub in BLOCK_SUBMODULES:
+                bt.add_module(sub, nn.Identity())
+            self.taps.blocks.add_module(str(i), bt)
         self._B = None
         for i, blk in enumerate(visual.blocks):
             blk.register_forward_hook(self._make_hook(f"block_{i}", True))
+        for i, blk in enumerate(visual.blocks):
+            for sub in BLOCK_SUBMODULES:
+                getattr(blk, sub).register_forward_hook(self._make_hook(f"blocks.{i}.{sub}", True))
         visual.merger.register_forward_hook(self._make_hook("merger", False))
 
     def _make_hook(self, name, reorder):
         def hook(module, inp, out):
-            tap = getattr(self.taps, name)
+            tap = self.taps
+            for part in name.split("."):
+                tap = getattr(tap, part)
             if len(tap._forward_hooks) == 0:  # nobody listening
                 return
             if isinstance(out, tuple):
